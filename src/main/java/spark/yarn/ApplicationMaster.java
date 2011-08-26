@@ -123,7 +123,7 @@ public class ApplicationMaster {
 	ctx.setContainerId(container.getId());
 	ctx.setResource(container.getResource());
 	ctx.setUser(UserGroupInformation.getCurrentUser().getShortUserName());
-	ctx.addCommand("/bin/sleep 60");
+	ctx.addCommand("/bin/sleep 10");
 	StartContainerRequest req = Records.newRecord(StartContainerRequest.class);
 	req.setContainerLaunchContext(ctx);
 	mgr.startContainer(req);
