@@ -23,14 +23,21 @@ import org.apache.hadoop.yarn.security.client.ClientRMSecurityInfo;
 import org.apache.hadoop.yarn.util.Records;
 
 class Client {
-
   private static final Log LOG = LogFactory.getLog(Client.class);
 
   private Configuration conf;
   private YarnRPC rpc;
   private ClientRMProtocol applicationsManager;
+  private String mesosHome;
+  private int numSlaves;
 
   public Client(String[] args) {
+	if (args.length != 2) {
+	  System.err.println("Usage: " + getClass().getName() + " <mesosHome> <numSlaves>");
+	  System.exit(1);
+	}
+	mesosHome = args[0];
+	numSlaves = Integer.parseInt(args[1]);
   }
 
   public static void main(String[] args) throws Exception {
@@ -61,9 +68,9 @@ class Client {
   private ApplicationSubmissionContext createApplicationSubmissionContext(
 	  Configuration jobConf) throws Exception {
 	ApplicationSubmissionContext appContext = Records.newRecord(ApplicationSubmissionContext.class);
-	ApplicationId applicationId = newApplicationId();
-	LOG.info("Got application ID " + applicationId);
-	appContext.setApplicationId(applicationId);
+	ApplicationId appId = newApplicationId();
+	LOG.info("Got application ID " + appId);
+	appContext.setApplicationId(appId);
 	Resource capability = Records.newRecord(Resource.class);
 	capability.setMemory(1024);
 	LOG.info("AppMaster capability = " + capability);
@@ -77,13 +84,16 @@ class Client {
 	if (home == null)
 	  home = new File(".").getAbsolutePath();
 	appContext.addCommand(home + "/bin/application-master " +
-		applicationId.getClusterTimestamp() + " " + 
-		applicationId.getId() + " " +
+		appId.getClusterTimestamp() + " " + 
+		appId.getId() + " " +
 		ApplicationConstants.AM_FAIL_COUNT_STRING + " " +
+		"\"" + mesosHome + "\" " +
+		numSlaves + " " +
+		ApplicationConstants.LOG_DIR_EXPANSION_VAR + " " +
 		"1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout " +
 		"2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr");
 
-	// TODO: RM should get this from RPC.
+	// TODO: RM should get this from RPC
 	appContext.setUser(UserGroupInformation.getCurrentUser().getShortUserName());
 	return appContext;
   }

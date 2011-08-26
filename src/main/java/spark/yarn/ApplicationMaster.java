@@ -1,12 +1,20 @@
 package spark.yarn;
 
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
 import java.net.InetSocketAddress;
 import java.security.PrivilegedAction;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.SynchronousQueue;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -16,6 +24,7 @@ import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.yarn.api.AMRMProtocol;
+import org.apache.hadoop.yarn.api.ApplicationConstants;
 import org.apache.hadoop.yarn.api.ContainerManager;
 import org.apache.hadoop.yarn.api.protocolrecords.AllocateRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.AllocateResponse;
@@ -47,26 +56,40 @@ public class ApplicationMaster {
   private Configuration conf;
   private YarnRPC rpc;
   private AMRMProtocol resourceManager;
+  private String mesosHome;
+  private int totalSlaves;
+  private String logDirectory;
   private int responseId = 0; // For identifying resource requests and responses
+  private Process master;
+  private String masterUrl;
 
   // Have a cache/map of UGIs so as to avoid creating too many RPC
   // client connection objects to the same NodeManager
   private Map<String, UserGroupInformation> ugiMap = new HashMap<String, UserGroupInformation>();
-  
+
   public static void main(String[] args) throws Exception {
 	new ApplicationMaster(args).run();
   }
 
   public ApplicationMaster(String[] args) {
-	// Get our application attempt ID from the command line arguments
+	if (args.length != 6) {
+	  throw new IllegalArgumentException("Expected 6 command-line arguments");
+	}
+	
+	// Get our application attempt ID from the command-line arguments
 	ApplicationId appId = Records.newRecord(ApplicationId.class);
-    appId.setClusterTimestamp(Long.valueOf(args[0]));
-    appId.setId(Integer.valueOf(args[1]));
-    int failCount = Integer.valueOf(args[2]);
+    appId.setClusterTimestamp(Long.parseLong(args[0]));
+    appId.setId(Integer.parseInt(args[1]));
+    int failCount = Integer.parseInt(args[2]);
     LOG.info("Application ID: " + appId + ", fail count: " + failCount);
     appAttemptId = Records.newRecord(ApplicationAttemptId.class);
     appAttemptId.setApplicationId(appId);
     appAttemptId.setAttemptId(failCount);
+    
+	// Get Mesos home and # of slaves from command-line arguments
+    mesosHome = args[3];
+    totalSlaves = Integer.parseInt(args[4]);
+    logDirectory = args[5];
     
     // Set up our configuration and RPC
 	conf = new Configuration();
@@ -74,36 +97,40 @@ public class ApplicationMaster {
   }
 
   private void run() throws IOException {
-	LOG.info("Starting app master");
+	LOG.info("Starting application master");
+	LOG.info("Working directory is " + new File(".").getAbsolutePath());
+	
 	resourceManager = connectToRM();
     registerWithRM();
+    
+    startMesosMaster();
 	
-    int totalTasks = 2;
-    int tasksLaunched = 0;
-    int tasksFinished = 0;
+    // Start and manange the slaves
+    int slavesLaunched = 0;
+    int slavesFinished = 0;
     boolean sentRequest = false;
     
     List<ResourceRequest> noRequests = new ArrayList<ResourceRequest>();
     List<ContainerId> noReleases = new ArrayList<ContainerId>();
     
-    while (tasksFinished != totalTasks) {
+    while (slavesFinished != totalSlaves) {
       AMResponse response;
       if (!sentRequest) {
         sentRequest = true;
-        ResourceRequest request = createRequest(totalTasks);
+        ResourceRequest request = createRequest(totalSlaves);
         LOG.info("Making resource request: " + request);
         response = allocate(Lists.newArrayList(request), noReleases);
       } else {
     	response = allocate(noRequests, noReleases);
       }
-      System.out.println("AM response: " + response);
+      LOG.info("AM response: " + response);
       for (Container container: response.getNewContainerList()) {
     	launchContainer(container);
-    	tasksLaunched++;
+    	slavesLaunched++;
       }
       for (Container container: response.getFinishedContainerList()) {
     	LOG.info("Container finished: " + container);
-    	tasksFinished++;
+    	slavesFinished++;
       }
       
   	  try {
@@ -113,8 +140,110 @@ public class ApplicationMaster {
       }
     }
 
-    LOG.info("Shutting down");
+    LOG.info("All slaves finished; shutting down");
+    master.destroy();
 	unregister();
+  }
+  
+  // Start mesos-master and read its URL into mesosUrl
+  private void startMesosMaster() throws IOException {
+    String[] command = new String[] {mesosHome + "/bin/mesos-master",
+    	"--port=0", "--log_dir=" + logDirectory};
+    master = Runtime.getRuntime().exec(command);
+    final SynchronousQueue<String> urlQueue = new SynchronousQueue<String>();
+
+    // Start a thread to redirect the process's stdout to a file
+    new Thread("stdout redirector for mesos-master") {
+      public void run() {
+        BufferedReader in = new BufferedReader(new InputStreamReader(master.getInputStream()));
+    	PrintWriter out = null;
+        try {
+          out = new PrintWriter(new FileWriter(logDirectory + "/mesos-master.stdout"));
+          String line = null;
+          while ((line = in.readLine()) != null) {
+            out.println(line);
+          }
+        } catch (Exception e) {
+          e.printStackTrace();
+        } finally {
+          if (out != null)
+        	out.close();
+        }
+      }
+    }.start();
+
+    // Start a thread to redirect the process's stderr to a file and also read the URL
+    new Thread("stderr redirector for mesos-master") {
+      public void run() {
+        BufferedReader in = new BufferedReader(new InputStreamReader(master.getErrorStream()));
+    	PrintWriter out = null;
+        try {
+          out = new PrintWriter(new FileWriter(logDirectory + "/mesos-master.stderr"));
+          boolean foundUrl = false;
+          Pattern pattern = Pattern.compile(".*Master started at (.*)");
+          String line = null;
+          while ((line = in.readLine()) != null) {
+            out.println(line);
+            if (!foundUrl) {
+              Matcher m = pattern.matcher(line);
+              if (m.matches()) {
+                String url = m.group(1);
+                urlQueue.put(url);
+                foundUrl = true;
+              }
+            }
+          }
+        } catch (Exception e) {
+          e.printStackTrace();
+        } finally {
+          if (out != null)
+        	out.close();
+        }
+      }
+    }.start();
+    
+    // Wait until we've read the URL
+    while (masterUrl == null) {
+      try {
+    	masterUrl = urlQueue.take();
+      } catch (InterruptedException e) {}
+    }
+    LOG.info("Mesos master started with URL " + masterUrl);
+    try {
+      Thread.sleep(500); // Give mesos-master a bit more time to start up
+    } catch (InterruptedException e) {}
+  }
+
+  private AMRMProtocol connectToRM() {
+	InetSocketAddress rmAddress = NetUtils.createSocketAddr(conf.get(
+	    YarnConfiguration.SCHEDULER_ADDRESS,
+	    YarnConfiguration.DEFAULT_SCHEDULER_BIND_ADDRESS));
+	LOG.info("Connecting to ResourceManager at " + rmAddress);
+	return ((AMRMProtocol) rpc.getProxy(AMRMProtocol.class, rmAddress, conf));
+  }
+
+  private void registerWithRM() throws YarnRemoteException {
+	RegisterApplicationMasterRequest req =
+      Records.newRecord(RegisterApplicationMasterRequest.class);
+    req.setApplicationAttemptId(appAttemptId);
+    req.setHost("");
+    req.setRpcPort(1);
+    req.setTrackingUrl("");
+	resourceManager.registerApplicationMaster(req);
+	LOG.info("Successfully registered with resource manager");
+  }
+
+  private ResourceRequest createRequest(int totalTasks) {
+	ResourceRequest request = Records.newRecord(ResourceRequest.class);
+    request.setHostName("*");
+    request.setNumContainers(totalTasks);
+    Priority pri = Records.newRecord(Priority.class);
+    pri.setPriority(1);
+    request.setPriority(pri);
+    Resource capability = Records.newRecord(Resource.class);
+    capability.setMemory(1024);
+    request.setCapability(capability);
+	return request;
   }
 
   private void launchContainer(Container container) throws IOException {
@@ -123,7 +252,13 @@ public class ApplicationMaster {
 	ctx.setContainerId(container.getId());
 	ctx.setResource(container.getResource());
 	ctx.setUser(UserGroupInformation.getCurrentUser().getShortUserName());
-	ctx.addCommand("/bin/sleep 10");
+	ctx.addCommand(mesosHome + "/bin/mesos-slave " +
+		"--master=" + masterUrl + " " +
+		"--resources=cpus:1\\;mem:1024 " +
+		"--log_dir=" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + " " +
+		"--work_dir=" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + " " +
+		"1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout " +
+		"2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr");
 	StartContainerRequest req = Records.newRecord(StartContainerRequest.class);
 	req.setContainerLaunchContext(ctx);
 	mgr.startContainer(req);
@@ -156,38 +291,6 @@ public class ApplicationMaster {
 	  }
 	});
 	return mgr;
-  }
-
-  private ResourceRequest createRequest(int totalTasks) {
-	ResourceRequest request = Records.newRecord(ResourceRequest.class);
-    request.setHostName("*");
-    request.setNumContainers(totalTasks);
-    Priority pri = Records.newRecord(Priority.class);
-    pri.setPriority(1);
-    request.setPriority(pri);
-    Resource capability = Records.newRecord(Resource.class);
-    capability.setMemory(1024);
-    request.setCapability(capability);
-	return request;
-  }
-
-  private AMRMProtocol connectToRM() {
-	InetSocketAddress rmAddress = NetUtils.createSocketAddr(conf.get(
-	    YarnConfiguration.SCHEDULER_ADDRESS,
-	    YarnConfiguration.DEFAULT_SCHEDULER_BIND_ADDRESS));
-	LOG.info("Connecting to ResourceManager at " + rmAddress);
-	return ((AMRMProtocol) rpc.getProxy(AMRMProtocol.class, rmAddress, conf));
-  }
-
-  private void registerWithRM() throws YarnRemoteException {
-	RegisterApplicationMasterRequest req =
-      Records.newRecord(RegisterApplicationMasterRequest.class);
-    req.setApplicationAttemptId(appAttemptId);
-    req.setHost("");
-    req.setRpcPort(1);
-    req.setTrackingUrl("");
-	resourceManager.registerApplicationMaster(req);
-	LOG.info("Successfully registered with resource manager");
   }
 
   private AMResponse allocate(List<ResourceRequest> resourceRequest, List<ContainerId> releases)

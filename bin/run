@@ -1,3 +1,16 @@
 #!/bin/bash
 export SPARK_YARN_HOME=`cd "$(dirname $0)/.."; pwd`
-java -cp $SPARK_YARN_HOME/target/spark-yarn-1.0-SNAPSHOT-jar-with-dependencies.jar:$SPARK_YARN_HOME/conf "$@"
+export SPARK_YARN_HOME
+
+CLASSPATH="$SPARK_YARN_HOME/target/spark-yarn-1.0-SNAPSHOT-jar-with-dependencies.jar"
+CLASSPATH+=":$SPARK_YARN_HOME/conf"
+if [ -n "$HADOOP_CONF_DIR" ]; then
+  CLASSPATH+=":$HADOOP_CONF_DIR"
+fi
+
+JAVA=java
+if [ -n "$JAVA_HOME" ]; then
+  JAVA="$JAVA_HOME/bin/java"
+fi
+
+$JAVA -cp $CLASSPATH "$@"
