@@ -1,6 +1,6 @@
 # Spark-Yarn
 
-`spark-yarn` launches Spark applications on YARN, the resource manager for the Hadoop MapReduce 2.0
+This project launches Spark applications on YARN, the resource manager for the Hadoop MapReduce 2.0
 project. You specify a JAR for the application, the locations where Mesos and Spark are installed
 on the cluster, and the number of slave resources to acquire, and `spark-yarn` will launch a cluster
 with the required resources and run your job.
