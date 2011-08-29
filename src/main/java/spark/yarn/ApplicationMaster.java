@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.security.PrivilegedAction;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -23,6 +24,8 @@ import org.apache.commons.cli.ParseException;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -63,33 +66,47 @@ public class ApplicationMaster {
   private String mesosHome;
   private String sparkHome;
   private int totalSlaves;
-  private int memory;
-  private int cpus;
+  private int slaveMem;
+  private int slaveCpus;
+  private int masterMem;
   private String logDirectory;
-  private int responseId = 0; // For identifying resource requests and responses
+  private String mainClass;
+  private String programArgs;
+  private URI jarUri;
+  
   private Process master;
   private String masterUrl;
+  private Process application;
+  private boolean appExited = false;
+  private int appExitCode = -1;
+  
+  private int requestId = 0; // For giving unique IDs to YARN resource requests
 
-  // Have a cache/map of UGIs so as to avoid creating too many RPC
+  // Have a cache of UGIs on different nodes to avoid creating too many RPC
   // client connection objects to the same NodeManager
   private Map<String, UserGroupInformation> ugiMap = new HashMap<String, UserGroupInformation>();
+
 
   public static void main(String[] args) throws Exception {
     new ApplicationMaster(args).run();
   }
 
-  public ApplicationMaster(String[] args) {
+  public ApplicationMaster(String[] args) throws Exception {
     try {
       Options opts = new Options();
       opts.addOption("yarn_timestamp", true, "YARN cluster timestamp");
       opts.addOption("yarn_id", true, "YARN application ID");
       opts.addOption("yarn_fail_count", true, "YARN application fail count");
-      opts.addOption("mesos_home", true, "Directory where Mesos is installed");
-      opts.addOption("spark_home", true, "Directory where Spark is installed");
-      opts.addOption("slaves", true, "Number of slaves");
-      opts.addOption("memory", true, "Memory per slave, in MB");
-      opts.addOption("cpus", true, "CPUs to use per slave");
-      opts.addOption("log_dir", true, "Log directory for our container");
+      opts.addOption("mesos_home", true, "directory where Mesos is installed");
+      opts.addOption("spark_home", true, "directory where Spark is installed");
+      opts.addOption("slaves", true, "number of slaves");
+      opts.addOption("slave_mem", true, "memory per slave, in MB");
+      opts.addOption("slave_cpus", true, "CPUs to use per slave");
+      opts.addOption("master_mem", true, "memory for master, in MB");
+      opts.addOption("class", true, "main class of application");
+      opts.addOption("args", true, "command line arguments for application");
+      opts.addOption("jar_uri", true, "full URI of the application JAR to download");
+      opts.addOption("log_dir", true, "log directory for our container");
       CommandLine line = new GnuParser().parse(opts, args);
 
       // Get our application attempt ID from the command line arguments
@@ -104,11 +121,17 @@ public class ApplicationMaster {
       
       // Get other command line arguments
       mesosHome = line.getOptionValue("mesos_home");
-      sparkHome = line.getOptionValue("mesos_home");
+      sparkHome = line.getOptionValue("spark_home");
       logDirectory = line.getOptionValue("log_dir");
       totalSlaves = Integer.parseInt(line.getOptionValue("slaves"));
-      memory = Integer.parseInt(line.getOptionValue("memory"));
-      cpus = Integer.parseInt(line.getOptionValue("cpus"));
+      slaveMem = Integer.parseInt(line.getOptionValue("slave_mem"));
+      slaveCpus = Integer.parseInt(line.getOptionValue("slave_cpus"));
+      masterMem = Integer.parseInt(line.getOptionValue("master_mem"));
+      mainClass = line.getOptionValue("class");
+      programArgs = line.getOptionValue("args", "");
+      String jarUriStr = line.getOptionValue("jar_uri");
+      LOG.info("Jar URI: " + jarUriStr);
+      jarUri = new URI(jarUriStr);
       
       // Set up our configuration and RPC
       conf = new Configuration();
@@ -126,9 +149,13 @@ public class ApplicationMaster {
     resourceManager = connectToRM();
     registerWithRM();
     
+    LOG.info("Downloading job JAR from " + jarUri);
+    FileSystem fs = FileSystem.get(jarUri, conf);
+    fs.copyToLocalFile(new Path(jarUri), new Path("job.jar"));
+
     startMesosMaster();
     
-    // Start and manange the slaves
+    // Start and manage the slaves
     int slavesLaunched = 0;
     int slavesFinished = 0;
     boolean sentRequest = false;
@@ -136,7 +163,7 @@ public class ApplicationMaster {
     List<ResourceRequest> noRequests = new ArrayList<ResourceRequest>();
     List<ContainerId> noReleases = new ArrayList<ContainerId>();
     
-    while (slavesFinished != totalSlaves) {
+    while (slavesFinished != totalSlaves && !appExited) {
       AMResponse response;
       if (!sentRequest) {
         sentRequest = true;
@@ -146,26 +173,42 @@ public class ApplicationMaster {
       } else {
         response = allocate(noRequests, noReleases);
       }
-      LOG.info("AM response: " + response);
+      
       for (Container container: response.getNewContainerList()) {
+        LOG.info("Launching container on " + container.getNodeId().getHost());
         launchContainer(container);
         slavesLaunched++;
+        if (slavesLaunched == totalSlaves) {
+          LOG.info("All slaves launched; starting user application");
+          try {
+            Thread.sleep(3000);
+          } catch (InterruptedException e) {}
+          startApplication();
+        }
       }
+      
       for (Container container: response.getFinishedContainerList()) {
         LOG.info("Container finished: " + container);
         slavesFinished++;
       }
       
-        try {
-          Thread.sleep(1000);
-      } catch (InterruptedException e) {
-          e.printStackTrace();
-      }
+      try {
+        Thread.sleep(1000);
+      } catch (InterruptedException e) {}
     }
 
-    LOG.info("All slaves finished; shutting down");
+    boolean succeeded = false;
+    if (appExited) {
+      LOG.info("Shutting down because user application exited");
+      succeeded = (appExitCode == 0); 
+    } else {
+      LOG.info("Shutting down because all containers died");
+    }
     master.destroy();
-    unregister();
+    if (application != null) {
+      application.destroy();
+    }
+    unregister(succeeded);
   }
   
   // Start mesos-master and read its URL into mesosUrl
@@ -236,6 +279,84 @@ public class ApplicationMaster {
       Thread.sleep(500); // Give mesos-master a bit more time to start up
     } catch (InterruptedException e) {}
   }
+  
+  // Start the user's application
+  private void startApplication() throws IOException {
+    try {
+      String sparkClasspath = getSparkClasspath();
+      String jobJar = new File("job.jar").getAbsolutePath();
+      String javaArgs = "-Xms" + (masterMem - 128) + "m -Xmx" + (masterMem - 128) + "m";
+      javaArgs += " -Djava.library.path=" + mesosHome + "/lib/java";
+      String substitutedArgs = programArgs.replaceAll("\\[MASTER\\]", masterUrl);
+      if (mainClass.equals("")) {
+        javaArgs += " -cp " + sparkClasspath + " -jar " + jobJar + " " + substitutedArgs; 
+      } else {
+        javaArgs += " -cp " + sparkClasspath + ":" + jobJar + " " + mainClass + " " + substitutedArgs;
+      }
+      String java = "java";
+      if (System.getenv("JAVA_HOME") != null) {
+        java = System.getenv("JAVA_HOME") + "/bin/java";
+      }
+      String bashCommand = java + " " + javaArgs +
+          " 1>" + logDirectory + "/application.stdout" +
+          " 2>" + logDirectory + "/application.stderr";
+      LOG.info("Command: " + bashCommand);
+      String[] command = new String[] {"bash", "-c", bashCommand};
+      String[] env = new String[] {"SPARK_HOME=" + sparkHome, "MASTER=" + masterUrl, 
+          "SPARK_MEM=" + (slaveMem - 128) + "m"};
+      application = Runtime.getRuntime().exec(command, env);
+      
+      new Thread("wait for user application") {
+        public void run() {
+          try {
+            appExitCode = application.waitFor();
+            appExited = true;
+            LOG.info("User application exited with code " + appExitCode);
+          } catch (InterruptedException e) {
+            e.printStackTrace();
+          }
+        }
+      }.start();
+      
+      LOG.info("User application started");
+    } catch (SparkClasspathException e) {
+      // Could not find the Spark classpath, either because SPARK_HOME is wrong or Spark wasn't compiled
+      LOG.fatal(e.getMessage());
+      unregister(false);
+      System.exit(1);
+      return;
+    }
+  }
+  
+  private static class SparkClasspathException extends Exception {
+    public SparkClasspathException(String message) {
+      super(message);
+    }
+  }
+
+  private String getSparkClasspath() throws YarnRemoteException, SparkClasspathException {
+    String assemblyJar = null;
+
+    // Find the target directory built by SBT
+    File targetDir = new File(sparkHome + "/core/target");
+    if (!targetDir.exists()) {
+      throw new SparkClasspathException("Path " + targetDir + " does not exist: " + 
+          "either you gave an invalid SPARK_HOME or you did not build Spark");
+    }
+
+    // Look in target to find the assembly JAR
+    for (File f: targetDir.listFiles()) {
+      if (f.getName().startsWith("core-assembly") && f.getName().endsWith(".jar")) {
+        assemblyJar = f.getAbsolutePath();
+      }
+    }
+    if (assemblyJar == null) {
+      throw new SparkClasspathException("Could not find Spark assembly JAR in " + targetDir + ": " +
+          "you probably didn't run sbt assembly");
+    }
+    
+    return assemblyJar;
+  }
 
   private AMRMProtocol connectToRM() {
     InetSocketAddress rmAddress = NetUtils.createSocketAddr(conf.get(
@@ -264,7 +385,7 @@ public class ApplicationMaster {
     pri.setPriority(1);
     request.setPriority(pri);
     Resource capability = Records.newRecord(Resource.class);
-    capability.setMemory(memory);
+    capability.setMemory(slaveMem);
     request.setCapability(capability);
     return request;
   }
@@ -277,7 +398,7 @@ public class ApplicationMaster {
     ctx.setUser(UserGroupInformation.getCurrentUser().getShortUserName());
     ctx.addCommand(mesosHome + "/bin/mesos-slave " +
         "--master=" + masterUrl + " " +
-        "--resources=cpus:" + cpus + "\\;mem:" + memory + " " +
+        "--resources=cpus:" + slaveCpus + "\\;mem:" + slaveMem + " " +
         "--log_dir=" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + " " +
         "--work_dir=" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + " " +
         "1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout " +
@@ -291,7 +412,7 @@ public class ApplicationMaster {
     // Based on similar code in the ContainerLauncher in Hadoop MapReduce
     ContainerToken contToken = container.getContainerToken();
     final String address = container.getNodeId().getHost() + ":" + container.getNodeId().getPort();
-    LOG.info("Connecting to container manager for " + address);
+    LOG.info("Connecting to ContainerManager at " + address);
     UserGroupInformation user = UserGroupInformation.getCurrentUser();
     if (UserGroupInformation.isSecurityEnabled()) {
       if (!ugiMap.containsKey(address)) {
@@ -319,7 +440,7 @@ public class ApplicationMaster {
   private AMResponse allocate(List<ResourceRequest> resourceRequest, List<ContainerId> releases)
       throws YarnRemoteException {
     AllocateRequest req = Records.newRecord(AllocateRequest.class);
-    req.setResponseId(++responseId);
+    req.setResponseId(++requestId);
     req.setApplicationAttemptId(appAttemptId);
     req.addAllAsks(resourceRequest);
     req.addAllReleases(releases);
@@ -327,12 +448,12 @@ public class ApplicationMaster {
     return resp.getAMResponse();
   }
 
-  private void unregister() throws YarnRemoteException {
+  private void unregister(boolean succeeded) throws YarnRemoteException {
     LOG.info("Unregistering application");
     FinishApplicationMasterRequest req =
       Records.newRecord(FinishApplicationMasterRequest.class);
     req.setAppAttemptId(appAttemptId);
-    req.setFinalState("SUCCEEDED");
+    req.setFinalState(succeeded ? "SUCCEEDED" : "FAILED");
     resourceManager.finishApplicationMaster(req);
   }
 }

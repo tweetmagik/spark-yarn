@@ -2,6 +2,7 @@ package spark.yarn;
 
 import java.io.File;
 import java.net.InetSocketAddress;
+import java.net.URI;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.GnuParser;
@@ -11,6 +12,8 @@ import org.apache.commons.cli.ParseException;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.security.SecurityInfo;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -30,24 +33,34 @@ import org.apache.hadoop.yarn.util.Records;
 class Client {
   private static final Log LOG = LogFactory.getLog(Client.class);
 
-  private Configuration conf;
-  private YarnRPC rpc;
-  private ClientRMProtocol applicationsManager;
   private String mesosHome;
   private String sparkHome;
   private int numSlaves;
-  private int memory;
-  private int cpus;
+  private int slaveMem;
+  private int slaveCpus;
+  private int masterMem;
+  private String jar;
+  private String mainClass;
+  private String programArgs;
+  
+  private Configuration conf;
+  private YarnRPC rpc;
+  private ClientRMProtocol applicationsManager;
+  private URI jarUri;
 
   public Client(String[] args) {
     try {
       Options opts = new Options();
-      opts.addOption("mesos_home", true, "Directory where Mesos is installed");
-      opts.addOption("spark_home", true, "Directory where Spark is installed");
-      opts.addOption("slaves", true, "Number of slaves");
-      opts.addOption("memory", true, "Memory per slave, in MB (default: 1024)");
-      opts.addOption("cpus", true, "CPUs to use per slave (default: 1)");
-      opts.addOption("help", false, "Print this help message");
+      opts.addOption("mesos_home", true, "directory where Mesos is installed");
+      opts.addOption("spark_home", true, "directory where Spark is installed");
+      opts.addOption("slaves", true, "number of slaves");
+      opts.addOption("slave_mem", true, "memory per slave, in MB (default: 1024)");
+      opts.addOption("master_mem", true, "memory for master, in MB (default: 1024)");
+      opts.addOption("slave_cpus", true, "CPUs to use per slave (default: 1)");
+      opts.addOption("jar", true, "JAR file containing job");
+      opts.addOption("class", true, "main class to run (default: look at JAR manifest)");
+      opts.addOption("args", true, "arguments to pass to main class");
+      opts.addOption("help", false, "print this help message");
       CommandLine line = new GnuParser().parse(opts, args);
       
       if (args.length == 0 || line.hasOption("help")) {
@@ -68,8 +81,16 @@ class Client {
         System.err.println("Number of slaves needs to be specified, using -slaves");
         System.exit(1);
       }
-      memory = Integer.parseInt(line.getOptionValue("memory", "1024"));
-      cpus = Integer.parseInt(line.getOptionValue("cpus", "1"));
+      if ((jar = line.getOptionValue("jar")) == null) {
+        System.err.println("Application JAR needs to be specified, using -jar");
+        System.exit(1);
+      }
+      slaveMem = Integer.parseInt(line.getOptionValue("slave_mem", "1024"));
+      slaveCpus = Integer.parseInt(line.getOptionValue("slave_cpus", "1"));
+      masterMem = Integer.parseInt(line.getOptionValue("master_mem", "1024"));
+      mainClass = line.getOptionValue("class", "");
+      programArgs = line.getOptionValue("args", "");
+      LOG.info("programArgs: " + programArgs);
     } catch (ParseException e) {
       System.err.println("Failed to parse command line options: " + e.getMessage());
       System.exit(1);
@@ -93,48 +114,62 @@ class Client {
     applicationsManager = 
       (ClientRMProtocol) rpc.getProxy(ClientRMProtocol.class, rmAddress, appsManagerServerConf);
 
-    ApplicationSubmissionContext appContext = createApplicationSubmissionContext(conf);
+    ApplicationId appId = newApplicationId();
+    LOG.info("Got application ID " + appId);
 
+    // Upload the job's JAR to HDFS 
+    FileSystem fs = FileSystem.get(conf);
+    Path stagingDir = Utils.getStagingDir(conf, appId);
+    Path destPath = new Path(stagingDir, "job.jar");
+    jarUri = fs.getUri().resolve(destPath.toString());
+    LOG.info("Uploading job JAR to " + jarUri);
+    fs.copyFromLocalFile(new Path(jar), destPath);
+
+    ApplicationSubmissionContext ctx = createApplicationSubmissionContext(conf, appId);
+    
+    // Launch the application master
     SubmitApplicationRequest request = Records.newRecord(SubmitApplicationRequest.class);
-    request.setApplicationSubmissionContext(appContext);
+    request.setApplicationSubmissionContext(ctx);
     applicationsManager.submitApplication(request);
     LOG.info("Submitted application to ResourceManager");
   }
 
-  private ApplicationSubmissionContext createApplicationSubmissionContext(Configuration jobConf)
-      throws Exception {
-    ApplicationSubmissionContext appContext = Records.newRecord(ApplicationSubmissionContext.class);
-    ApplicationId appId = newApplicationId();
-    LOG.info("Got application ID " + appId);
-    appContext.setApplicationId(appId);
+  private ApplicationSubmissionContext createApplicationSubmissionContext(
+      Configuration conf, ApplicationId appId) throws Exception {
+    ApplicationSubmissionContext ctx = Records.newRecord(ApplicationSubmissionContext.class);
+    ctx.setApplicationId(appId);
     Resource capability = Records.newRecord(Resource.class);
-    capability.setMemory(1024);
+    capability.setMemory(masterMem);
     LOG.info("AppMaster capability = " + capability);
-    appContext.setMasterCapability(capability);
+    ctx.setMasterCapability(capability);
 
     // Add job name
-    appContext.setApplicationName("Spark");
+    ctx.setApplicationName("Spark");
 
     // Add command line
     String home = System.getenv("SPARK_YARN_HOME");
     if (home == null)
       home = new File(".").getAbsolutePath();
-    appContext.addCommand(home + "/bin/application-master " +
+    ctx.addCommand(home + "/bin/application-master " +
         "-yarn_timestamp " + appId.getClusterTimestamp() + " " +
         "-yarn_id " + appId.getId() + " " +
         "-yarn_fail_count " + ApplicationConstants.AM_FAIL_COUNT_STRING + " " +
-        "-mesos_home \"" + mesosHome + "\" " +  
-        "-spark_home \"" + sparkHome + "\" " +
+        "-mesos_home " + Utils.quote(mesosHome) + " " +  
+        "-spark_home " + Utils.quote(sparkHome) + " " +
         "-slaves " + numSlaves + " " +
-        "-memory " + memory + " " +
-        "-cpus " + cpus + " " +
+        "-slave_mem " + slaveMem + " " +
+        "-slave_cpus " + slaveCpus + " " +
+        "-master_mem " + masterMem + " " +
+        "-jar_uri " + jarUri + " " +
+        "-class " + Utils.quote(mainClass) + " " +
+        (programArgs.equals("") ? "" : "-args " + Utils.quote(programArgs) + " ") +
         "-log_dir " + ApplicationConstants.LOG_DIR_EXPANSION_VAR + " " +
         "1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout " +
         "2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr");
 
     // TODO: RM should get this from RPC
-    appContext.setUser(UserGroupInformation.getCurrentUser().getShortUserName());
-    return appContext;
+    ctx.setUser(UserGroupInformation.getCurrentUser().getShortUserName());
+    return ctx;
   }
 
   private ApplicationId newApplicationId() throws YarnRemoteException {
