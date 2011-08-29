@@ -28,7 +28,7 @@ a list of the available options. At the very least, you will need to pass the fo
 In addition, you should set the `HADOOP_CONF_DIR` environment variable to refer to your
 Hadoop/YARN installation's config directory.
 
-## Viewing Output from your Job
+## Viewing Output From Your Job
 
 `spark-yarn` places log files in the standard YARN log directory for applications. There will
 be multiple files with the standard output and error streams of various processes.
